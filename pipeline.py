@@ -22,6 +22,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Engine version (helpful to confirm you’re on the new pipeline)
+ENGINE_VERSION = "v1.1.1"
 
 # ── Match confidence levels ────────────────────────────────────────────────────
 CONFIDENCE_EXACT = "Exact"
@@ -63,16 +65,15 @@ def fetch_tour_data(source: str) -> Dict[str, Any]:
             raise RuntimeError(f"HTTP {e.code} fetching tour data: {e.reason}")
         except urllib.error.URLError as e:
             raise RuntimeError(f"Network error fetching tour data: {e.reason}")
-        except Exception as e:  # paranoid guard
+        except Exception as e:
             raise RuntimeError(f"Failed to fetch tour data: {e}")
     else:
         # Local file
         try:
-            path = Path(source)
-            raw = path.read_text(encoding="utf-8")
+            raw = Path(source).read_text(encoding="utf-8")
         except FileNotFoundError:
             raise RuntimeError(f"Local file not found: {source}")
-        except Exception as e:  # paranoid guard
+        except Exception as e:
             raise RuntimeError(f"Failed to read local file: {e}")
 
     try:
@@ -104,7 +105,6 @@ def _parse_warner_style_catalog(raw: str) -> List[Dict[str, str]]:
     if not rows:
         return []
 
-    # First row is one cell containing the header string
     header_cell = rows[0][0].strip().strip('"').lstrip("\ufeff")
     header = [h.strip() for h in header_cell.split(",")]
 
@@ -153,7 +153,6 @@ def load_catalog(catalog_file) -> List[Dict[str, str]]:
     reader = csv.reader(io.StringIO(raw))
     first_row = next(reader, None)
     if first_row is not None and len(first_row) == 1 and "," in first_row[0]:
-        # Warner-style quoted lines
         parsed_rows = _parse_warner_style_catalog(raw)
     else:
         parsed_rows = list(csv.DictReader(io.StringIO(raw)))
@@ -180,7 +179,6 @@ def load_catalog(catalog_file) -> List[Dict[str, str]]:
         )
 
         if not catalog_id or not title:
-            # Keep the row but we won't be able to match to it
             row["catalog_id"] = catalog_id or ""
             row["song_title"] = title or ""
         else:
@@ -345,9 +343,8 @@ def deterministic_match(
         for entry in catalog:
             title = entry.get("song_title") or ""
             title_norm = _normalize_str(_strip_qualifiers(title))
-            # Skip exact equality (would already have matched above)
             if title_norm == base:
-                continue
+                continue  # would have matched above
             # Abbreviation-like containment either way
             if base in title_norm or title_norm in base:
                 candidates.append(entry)
@@ -377,7 +374,7 @@ You will receive:
 
 Your analysis must account for:
   ABBREVIATIONS: "Tokyo" might mean "Midnight in Tokyo"
-  VARIATIONS: "Shattered Glass" might mean "Shatter"
+  VARIATIONS: small wording differences
   MEDLEYS: "Song A / Song B" means both songs were performed together; report each match separately
   GARBLED TEXT: "Smsls Lk Tn Sprt" is likely "Smells Like Teen Spirit" (not in our catalog)
   COVERS: A song not in our catalog is a cover or uncontrolled song — do NOT force a match
@@ -438,7 +435,7 @@ Analyze this track and return your JSON result."""
             max_tokens=512,
         )
         raw = response.choices[0].message.content.strip()
-    except Exception as e:  # runtime safeguard
+    except Exception as e:
         return {
             "matched_catalog_id": None,
             "match_confidence": CONFIDENCE_NONE,
@@ -468,14 +465,14 @@ Analyze this track and return your JSON result."""
     # Sanitize and filter matches:
     #   - only keep catalog_ids that actually exist in the catalog
     #   - normalise confidence labels
-    real_matches = []
+    real_matches: List[Dict[str, Any]] = []
     for m in matches:
         cid = m.get("catalog_id")
         if not cid:
             continue
         cid = str(cid).strip()
         if cid not in valid_ids:
-            # Ignore LLM hallucinated IDs
+            # Ignore hallucinated IDs
             continue
 
         conf = (m.get("match_confidence") or "").strip().title()
@@ -589,6 +586,7 @@ def run_pipeline(
             "artist": data.get("artist"),
             "tour": data.get("tour"),
             "show_count": len(data.get("shows", [])),
+            "engine_version": ENGINE_VERSION,
         }
     except Exception as e:
         errors.append(f"Tour data fetch failed: {e}")
@@ -681,6 +679,7 @@ def run_pipeline(
         "deterministic": n_pre,
         "llm_resolved": n_llm,
         "llm_savings_pct": round((n_pre / total_tracks * 100) if total_tracks else 0, 1),
+        "engine_version": ENGINE_VERSION,
     }
 
     return result
