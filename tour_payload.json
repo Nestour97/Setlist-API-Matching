@@ -1,0 +1,33 @@
+{
+  "status": "success",
+  "data": {
+    "artist": "The Neon Lights",
+    "tour": "The Midnight Tour 2024",
+    "shows": [
+      {
+        "date": "2024-11-15",
+        "venue": "The Echo Lounge",
+        "city": "Los Angeles",
+        "setlist": [
+          "Neon Dreams",
+          "Tokyo (Acoustic)",
+          "Desert Rain / Ocean Avenue",
+          "Wonderwall",
+          "Shattered Glass"
+        ]
+      },
+      {
+        "date": "2024-11-16",
+        "venue": "Fillmore",
+        "city": "San Francisco",
+        "setlist": [
+          "Neon Dreams",
+          "Velocity (Extended Jam)",
+          "Golden Gate",
+          "Midnight In Tokyo",
+          "Smsls Lk Tn Sprt"
+        ]
+      }
+    ]
+  }
+}
