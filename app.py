@@ -624,17 +624,110 @@ with col_src:
 with col_cat:
     st.markdown(f'<div class="wc-section">Internal Catalog</div>', unsafe_allow_html=True)
     if uploaded_catalog:
-        st.markdown(
-            f'<div class="success-box">✓ Uploaded: <strong>{uploaded_catalog.name}</strong> '
-            f'({uploaded_catalog.size:,} bytes)</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            f'<div class="info-box">📄 Using bundled <code style="color:{GOLD};font-size:11px">catalog.csv</code> '
-            f'(13 controlled songs)</div>',
-            unsafe_allow_html=True,
-        )
+        # Validate uploaded catalog immediately — show preview + warn on schema issues
+        try:
+            import csv as _csv, io as _io
+            uploaded_catalog.seek(0)
+            _rows = list(_csv.DictReader(_io.StringIO(
+                uploaded_catalog.read().decode("utf-8", errors="replace")
+            )))
+            uploaded_catalog.seek(0)
+            _cols   = list(_rows[0].keys()) if _rows else []
+            _has_id = "catalog_id" in _cols
+            _title_col = next((c for c in ("title","song_title","name") if c in _cols), None)
+
+            if not _has_id or not _title_col:
+                st.markdown(
+                    f'<div class="error-box">⚠ Uploaded file is missing required columns.<br>'
+                    f'Found: {", ".join(_cols)}<br>'
+                    f'Need: <strong>catalog_id</strong> + <strong>title</strong> (or song_title).<br>'
+                    f'<strong>Falling back to bundled catalog.csv</strong></div>',
+                    unsafe_allow_html=True,
+                )
+                uploaded_catalog = None   # force fallback to bundled
+            else:
+                _ids    = [r["catalog_id"]       for r in _rows]
+                _titles = [r.get(_title_col, "") for r in _rows]
+                # Check if this looks like the old wrong catalog (CAT-002=Tokyo Midnight etc)
+                _id_map = {r["catalog_id"]: r.get(_title_col,"") for r in _rows}
+                _wrong_hints = [
+                    k for k,v in _id_map.items()
+                    if (k=="CAT-002" and "Tokyo Midnight" in v)
+                    or (k=="CAT-003" and v in ("Desert Rain","Shatter","Shattered"))
+                    or (k=="CAT-013" and "Midnight" in v)
+                ]
+                if _wrong_hints:
+                    st.markdown(
+                        f'<div class="error-box">⚠ Uploaded catalog appears to have incorrect IDs '
+                        f'(e.g. {_id_map.get("CAT-002","?")} as CAT-002, '
+                        f'{_id_map.get("CAT-013","?")} as CAT-013).<br>'
+                        f'This is an old/wrong version of the catalog.<br>'
+                        f'<strong>Using bundled catalog.csv instead.</strong></div>',
+                        unsafe_allow_html=True,
+                    )
+                    uploaded_catalog = None   # force correct bundled catalog
+                else:
+                    st.markdown(
+                        f'<div class="success-box">✓ Uploaded: <strong>{uploaded_catalog.name}</strong> '
+                        f'· {len(_rows)} songs · column: <code>{_title_col}</code></div>',
+                        unsafe_allow_html=True,
+                    )
+                    # Show first few rows as preview
+                    preview_html = "".join(
+                        f'<div style="font-family:DM Mono,monospace;font-size:10px;color:{GREY2};'
+                        f'padding:2px 0;border-bottom:1px solid {BLACK3}">'
+                        f'<span style="color:{GOLD};margin-right:12px">{r["catalog_id"]}</span>'
+                        f'{r.get(_title_col,"")}</div>'
+                        for r in _rows[:6]
+                    )
+                    if len(_rows) > 6:
+                        preview_html += f'<div style="font-size:10px;color:{GREY3};margin-top:4px">…and {len(_rows)-6} more</div>'
+                    st.markdown(
+                        f'<div style="background:{BLACK2};border:1px solid {BLACK3};'
+                        f'border-left:3px solid {GOLD};padding:10px 14px;margin-top:6px">'
+                        f'{preview_html}</div>',
+                        unsafe_allow_html=True,
+                    )
+        except Exception as _e:
+            st.markdown(
+                f'<div class="error-box">⚠ Could not read uploaded catalog: {_e}<br>'
+                f'Using bundled catalog.csv</div>',
+                unsafe_allow_html=True,
+            )
+            uploaded_catalog = None
+
+    if not uploaded_catalog:
+        # Load bundled catalog for preview
+        try:
+            import csv as _csv2
+            with open("catalog.csv") as _f:
+                _brows = list(_csv2.DictReader(_f))
+            preview_html = "".join(
+                f'<div style="font-family:DM Mono,monospace;font-size:10px;color:{GREY2};'
+                f'padding:2px 0;border-bottom:1px solid {BLACK3}">'
+                f'<span style="color:{GOLD};margin-right:12px">{r["catalog_id"]}</span>'
+                f'{r.get("title", r.get("song_title",""))}</div>'
+                for r in _brows[:6]
+            )
+            if len(_brows) > 6:
+                preview_html += f'<div style="font-size:10px;color:{GREY3};margin-top:4px">…and {len(_brows)-6} more</div>'
+            st.markdown(
+                f'<div class="info-box" style="margin-bottom:6px">📄 Using bundled '
+                f'<code style="color:{GOLD};font-size:11px">catalog.csv</code> '
+                f'· {len(_brows)} controlled songs</div>',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<div style="background:{BLACK2};border:1px solid {BLACK3};'
+                f'border-left:3px solid {GOLD};padding:10px 14px">'
+                f'{preview_html}</div>',
+                unsafe_allow_html=True,
+            )
+        except Exception:
+            st.markdown(
+                f'<div class="warn-box">catalog.csv not found in working directory</div>',
+                unsafe_allow_html=True,
+            )
 
 # ── Run button ─────────────────────────────────────────────────────────────────
 st.markdown("<br>", unsafe_allow_html=True)
@@ -666,7 +759,7 @@ if run_clicked:
     else:
         tour_source = "tour_payload.json"
 
-    # Determine catalog source
+    # Determine catalog source (uploaded_catalog may have been set to None above if invalid)
     if uploaded_catalog:
         uploaded_catalog.seek(0)
         catalog_source = uploaded_catalog
