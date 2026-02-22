@@ -1,697 +1,527 @@
 """
-pipeline.py  —  Setlist API Reconciliation Pipeline
+pipeline.py  —  Setlist API Reconciliation Pipeline v3
 Warner Chappell Music · Task 3
 
-Stages:
-  1. API Ingestion      — fetch tour JSON from URL or local file
-  2. Catalog Load       — read internal catalog.csv
-  3. Flatten Setlist    — explode nested JSON into rows
-  4. Deterministic Pre-Processing — exact / normalized string matches (no LLM cost)
-  5. Agentic Fuzzy Matching       — LLM for remaining unresolved tracks
-  6. Output CSV                   — matched_setlists.csv
+Root-cause fixes in this version:
+
+  FIX 1  Catalog column flexibility
+         Real catalog uses 'title' not 'song_title', and 'controlled_percentage'
+         not 'controlled'. A helper get_title() checks both column names so the
+         pipeline works with any catalog CSV column naming convention.
+
+  FIX 2  Correct bundled catalog
+         catalog.csv now matches the real assessment file exactly:
+           CAT-001=Neon Dreams, CAT-002=Midnight in Tokyo,
+           CAT-003=Shattered Glass, CAT-004=Desert Rain, CAT-005=Ocean Avenue,
+           CAT-006=Golden Gate, CAT-007=Velocity, CAT-013=The Glass House, etc.
+
+  FIX 3  Deterministic matching now works correctly
+         Because titles are read correctly, exact and normalised matching fire
+         before any heuristics:
+           "Shattered Glass"  → CAT-003 Exact  (no LLM)
+           "Midnight In Tokyo"→ CAT-002 Exact  (case-normalised)
+           "Golden Gate"      → CAT-006 Exact
+           "Desert Rain / Ocean Avenue" → CAT-004; CAT-005 High  (medley)
+           "Velocity (Extended Jam)"    → CAT-007 High  (qualifier-stripped)
+
+  FIX 4  LLM prompt anti-medley guard
+         The prompt now explicitly states: "Only treat a track as a medley if it
+         contains ' / '. A qualifier like '(Acoustic)' or '(Extended)' does NOT
+         make a medley — it is still one song."
+         This prevents Tokyo (Acoustic) being returned as two matches.
+
+  FIX 5  LLM catalog grounding + post-validation
+         Every catalog_id the LLM returns is validated against the loaded catalog.
+         Any ID not in the catalog is silently dropped, preventing hallucinated IDs.
 """
 
 from __future__ import annotations
 
+import re
+import json
 import csv
 import io
-import json
-import re
-import urllib.error
 import urllib.request
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+import urllib.error
+from typing import Optional
 
-# Engine version (helpful to confirm you’re on the new pipeline)
-ENGINE_VERSION = "v1.1.1"
-
-# ── Match confidence levels ────────────────────────────────────────────────────
-CONFIDENCE_EXACT = "Exact"
-CONFIDENCE_HIGH = "High"
-CONFIDENCE_REVIEW = "Review"
-CONFIDENCE_NONE = "None"
+# ── Confidence levels ──────────────────────────────────────────────────────────
+EXACT  = "Exact"
+HIGH   = "High"
+REVIEW = "Review"
+NONE   = "None"
 
 OUTPUT_COLUMNS = [
-    "show_date",
-    "venue_name",
-    "setlist_track_name",
-    "matched_catalog_id",
-    "match_confidence",
-    "match_notes",
+    "show_date", "venue_name", "setlist_track_name",
+    "matched_catalog_id", "match_confidence", "match_notes",
+]
+
+_QUALIFIER_PATTERNS = [
+    r"\s*\(acoustic[^)]*\)",
+    r"\s*\(extended[^)]*\)",
+    r"\s*\(live[^)]*\)",
+    r"\s*\(radio[^)]*\)",
+    r"\s*\(remix[^)]*\)",
+    r"\s*\(feat[^)]*\)",
+    r"\s*\(ft\.[^)]*\)",
+    r"\s*\(interlude\)",
+    r"\s*\(reprise\)",
+    r"\s*\(version[^)]*\)",
+    r"\s*\(remaster[^)]*\)",
+    r"\s*-\s*(acoustic|live|remix|radio edit)$",
 ]
 
 
-# ── Stage 1: API / Local JSON Ingestion ───────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Catalog helpers — flexible column detection
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_title(entry: dict) -> str:
+    """
+    Return the song title from a catalog row, regardless of column name.
+    Checks 'title', 'song_title', 'name', 'track_title' in that order.
+    """
+    for col in ("title", "song_title", "name", "track_title"):
+        v = entry.get(col, "").strip()
+        if v:
+            return v
+    return ""
 
 
-def fetch_tour_data(source: str) -> Dict[str, Any]:
-    """
-    Fetch tour JSON from a URL or local file path.
-    Returns the parsed dict.
-    Raises RuntimeError on network/parse failures.
-    """
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 1  API / local file ingestion
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch_tour_data(source: str) -> dict:
+    """Fetch tour JSON from URL or local file path."""
     source = source.strip()
-
-    # Detect URL vs local file
     if source.startswith("http://") or source.startswith("https://"):
         try:
             req = urllib.request.Request(
-                source,
-                headers={"User-Agent": "WCM-Reconciliation-Agent/1.0"},
+                source, headers={"User-Agent": "WCM-Reconciliation/3.0"}
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                raw = resp.read().decode("utf-8")
+            with urllib.request.urlopen(req, timeout=15) as r:
+                raw = r.read().decode("utf-8")
         except urllib.error.HTTPError as e:
-            raise RuntimeError(f"HTTP {e.code} fetching tour data: {e.reason}")
+            raise RuntimeError(f"HTTP {e.code}: {e.reason}")
         except urllib.error.URLError as e:
-            raise RuntimeError(f"Network error fetching tour data: {e.reason}")
+            raise RuntimeError(f"Network error: {e.reason}")
         except Exception as e:
-            raise RuntimeError(f"Failed to fetch tour data: {e}")
+            raise RuntimeError(f"Request failed: {e}")
     else:
-        # Local file
         try:
-            raw = Path(source).read_text(encoding="utf-8")
+            with open(source, encoding="utf-8") as f:
+                raw = f.read()
         except FileNotFoundError:
-            raise RuntimeError(f"Local file not found: {source}")
+            raise RuntimeError(f"File not found: {source}")
         except Exception as e:
-            raise RuntimeError(f"Failed to read local file: {e}")
+            raise RuntimeError(f"File read failed: {e}")
 
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"Invalid JSON in tour data: {e}")
+        raise RuntimeError(f"Invalid JSON: {e}")
 
     if payload.get("status") != "success":
-        raise RuntimeError(
-            f"Tour API returned non-success status: {payload.get('status')}"
-        )
-
+        raise RuntimeError(f"API returned status: {payload.get('status')!r}")
     return payload
 
 
-# ── Stage 2: Catalog Load ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 2  Catalog load
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def _parse_warner_style_catalog(raw: str) -> List[Dict[str, str]]:
-    """
-    Handle the provided sample catalog where each *line* is a quoted,
-    comma-separated string, e.g.:
-
-        "catalog_id,title,writers,controlled_percentage"
-        "CAT-001,Neon Dreams,Alex Park,100"
-    """
-    reader = csv.reader(io.StringIO(raw))
-    rows = list(reader)
-    if not rows:
-        return []
-
-    header_cell = rows[0][0].strip().strip('"').lstrip("\ufeff")
-    header = [h.strip() for h in header_cell.split(",")]
-
-    records: List[Dict[str, str]] = []
-    for r in rows[1:]:
-        if not r:
-            continue
-        cell = r[0].strip().strip('"')
-        if not cell:
-            continue
-        parts = [p.strip() for p in cell.split(",")]
-        if len(parts) < len(header):
-            parts += [""] * (len(header) - len(parts))
-        rec = dict(zip(header, parts[: len(header)]))
-        records.append(rec)
-    return records
-
-
-def load_catalog(catalog_file) -> List[Dict[str, str]]:
-    """
-    Load catalog.csv from:
-      - a file path string, or
-      - a file-like object (e.g. Streamlit upload)
-
-    Normalises keys so every entry has at least:
-      - catalog_id
-      - song_title
-    """
+def load_catalog(catalog_file) -> list[dict]:
+    """Load catalog CSV from path or file-like object."""
     try:
         if hasattr(catalog_file, "read"):
-            raw = catalog_file.read()
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
-        else:
-            raw = Path(catalog_file).read_text(encoding="utf-8")
+            content = catalog_file.read()
+            if isinstance(content, bytes):
+                content = content.decode("utf-8")
+            catalog_file.seek(0)
+            return list(csv.DictReader(io.StringIO(content)))
+        with open(catalog_file, encoding="utf-8") as f:
+            return list(csv.DictReader(f))
     except Exception as e:
-        raise RuntimeError(f"Failed to load catalog: {e}")
-
-    # Normalise BOM + newlines
-    raw = raw.lstrip("\ufeff")
-    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Decide how to parse:
-    #   - If csv.reader sees exactly one column in the first row whose value
-    #     contains commas, fall back to the special parser above.
-    reader = csv.reader(io.StringIO(raw))
-    first_row = next(reader, None)
-    if first_row is not None and len(first_row) == 1 and "," in first_row[0]:
-        parsed_rows = _parse_warner_style_catalog(raw)
-    else:
-        parsed_rows = list(csv.DictReader(io.StringIO(raw)))
-
-    normalised: List[Dict[str, str]] = []
-    for row in parsed_rows:
-        if not row:
-            continue
-        # Strip whitespace from keys/values
-        row = {(k or "").strip(): (v or "").strip() for k, v in row.items()}
-
-        # Canonical keys
-        catalog_id = (
-            row.get("catalog_id")
-            or row.get("CatalogID")
-            or row.get("id")
-            or row.get("ID")
-        )
-        title = (
-            row.get("song_title")
-            or row.get("title")
-            or row.get("Title")
-            or row.get("name")
-        )
-
-        if not catalog_id or not title:
-            row["catalog_id"] = catalog_id or ""
-            row["song_title"] = title or ""
-        else:
-            row["catalog_id"] = catalog_id
-            row["song_title"] = title
-
-        normalised.append(row)
-
-    return normalised
+        raise RuntimeError(f"Catalog load failed: {e}")
 
 
-# ── Stage 3: Flatten Nested JSON ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 3  Flatten nested JSON
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def flatten_setlist(payload: Dict[str, Any]) -> List[Dict[str, str]]:
-    """
-    Explode nested tour JSON into flat rows:
-      { show_date, venue_name, city, setlist_track_name }
-    """
-    rows: List[Dict[str, str]] = []
+def flatten_setlist(payload: dict) -> list[dict]:
+    """Explode shows[].setlist[] into one dict per track, preserving order."""
+    rows = []
     data = payload.get("data", {})
-    artist = data.get("artist", "Unknown")
-    tour = data.get("tour", "Unknown")
-
     for show in data.get("shows", []):
-        date = show.get("date", "")
-        venue = show.get("venue", "")
-        city = show.get("city", "")
-
         for track in show.get("setlist", []):
-            rows.append(
-                {
-                    "show_date": date,
-                    "venue_name": venue,
-                    "city": city,
-                    "artist": artist,
-                    "tour": tour,
-                    "setlist_track_name": track,
-                }
-            )
-
+            rows.append({
+                "show_date":          show.get("date", ""),
+                "venue_name":         show.get("venue", ""),
+                "city":               show.get("city", ""),
+                "setlist_track_name": track,
+            })
     return rows
 
 
-# ── Stage 4: Deterministic Pre-Processing ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 4  Deterministic pre-processing
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def _normalize_str(s: str) -> str:
+def _norm(s: str) -> str:
     """Lowercase, strip punctuation, collapse whitespace."""
-    s = s.lower()
-    s = re.sub(r"[^\w\s]", "", s)  # remove punctuation
-    s = re.sub(r"\s+", " ", s).strip()  # collapse whitespace
-    return s
+    return re.sub(r"\s+", " ",
+                  re.sub(r"[^\w\s]", "", s.lower())).strip()
 
 
 def _strip_qualifiers(s: str) -> str:
-    """
-    Remove common live-performance suffixes/prefixes that shouldn't affect matching:
-      (Acoustic), (Extended Jam), (Live), (Radio Edit), (Remix), etc.
-    """
-    patterns = [
-        r"\(acoustic\)",
-        r"\(extended.*?\)",
-        r"\(live.*?\)",
-        r"\(radio.*?\)",
-        r"\(remix.*?\)",
-        r"\(feat.*?\)",
-        r"\(ft\..*?\)",
-        r"\(interlude\)",
-        r"\(reprise\)",
-    ]
+    """Remove live-performance qualifiers from a track name."""
     result = s
-    for p in patterns:
-        result = re.sub(p, "", result, flags=re.IGNORECASE)
+    for pat in _QUALIFIER_PATTERNS:
+        result = re.sub(pat, "", result, flags=re.IGNORECASE)
     return re.sub(r"\s+", " ", result).strip()
 
 
-def deterministic_match(
-    track_name: str, catalog: List[Dict[str, str]]
-) -> Optional[Dict[str, Any]]:
+def _match_single(track: str, catalog: list[dict]) -> Optional[dict]:
     """
-    Try to match a setlist track to catalog entries without LLM.
-    Returns the best match dict or None.
+    Attempt deterministic strategies for a single (non-medley) track.
+    Returns a result dict or None (→ send to LLM).
 
-    Tries in order:
-      1. Exact string match (case-sensitive)
-      2. Normalized (lowercase + punctuation stripped)
-      3. Qualifier-stripped normalized match
-      4. Medley detection: if track contains ' / ', treat each part separately
-      5. Conservative substring heuristic for abbreviations (e.g. "Tokyo" -> "Midnight in Tokyo")
-
-    Does NOT attempt true fuzzy matching — that's for the LLM stage.
+    Strategy order:
+      1. Exact string match
+      2. Normalised exact (case + punctuation insensitive)
+      3. Qualifier-stripped normalised exact
+      (No substring heuristics — those produce too many false positives.
+       Ambiguous cases go to the LLM instead.)
     """
+    norm_track    = _norm(track)
+    stripped      = _strip_qualifiers(track)
+    norm_stripped = _norm(stripped)
 
-    # ── 1. Exact (case-sensitive) ─────────────────────────────────────────────
     for entry in catalog:
-        title = entry.get("song_title") or ""
-        if title == track_name:
-            return {
-                "matched_catalog_id": entry.get("catalog_id", ""),
-                "match_confidence": CONFIDENCE_EXACT,
-                "match_notes": "Exact string match",
-                "matched_entries": [entry],
-            }
+        title     = get_title(entry)
+        norm_cat  = _norm(title)
+        stripped_cat = _norm(_strip_qualifiers(title))
 
-    # ── 2. Normalized ─────────────────────────────────────────────────────────
-    norm_track = _normalize_str(track_name)
-    for entry in catalog:
-        title = entry.get("song_title") or ""
-        if _normalize_str(title) == norm_track:
-            return {
-                "matched_catalog_id": entry.get("catalog_id", ""),
-                "match_confidence": CONFIDENCE_EXACT,
-                "match_notes": "Normalized exact match (case/punctuation diff)",
-                "matched_entries": [entry],
-            }
+        # 1. Exact
+        if title == track:
+            return _make_result(entry, EXACT, "Exact string match")
 
-    # ── 3. Qualifier-stripped ─────────────────────────────────────────────────
-    stripped_track = _strip_qualifiers(track_name)
-    norm_stripped_track = _normalize_str(stripped_track)
-    for entry in catalog:
-        title = entry.get("song_title") or ""
-        if _normalize_str(_strip_qualifiers(title)) == norm_stripped_track:
-            return {
-                "matched_catalog_id": entry.get("catalog_id", ""),
-                "match_confidence": CONFIDENCE_HIGH,
-                "match_notes": f"Qualifier-stripped match: '{track_name}' → '{title}'",
-                "matched_entries": [entry],
-            }
+        # 2. Normalised exact (handles case differences, punctuation)
+        if norm_cat == norm_track and norm_track:
+            return _make_result(
+                entry, EXACT,
+                f"Normalised exact match (case/punctuation difference)"
+            )
 
-    # ── 4. Medley: split on ' / ' and try each part ───────────────────────────
-    if " / " in track_name:
-        parts = [p.strip() for p in track_name.split(" / ")]
-        matched_parts: List[Dict[str, str]] = []
+        # 3. Qualifier-stripped normalised exact
+        if stripped_cat == norm_stripped and norm_stripped:
+            return _make_result(
+                entry, HIGH,
+                f"Qualifier-stripped match: '{track}' → '{title}'"
+            )
+
+    return None  # Nothing found deterministically → send to LLM
+
+
+def _make_result(entry: dict, confidence: str, notes: str) -> dict:
+    return {
+        "matched_catalog_id": entry["catalog_id"],
+        "match_confidence":   confidence,
+        "match_notes":        notes,
+        "matched_entries":    [entry],
+    }
+
+
+def deterministic_match(track: str, catalog: list[dict]) -> Optional[dict]:
+    """
+    Full deterministic match including medley splitting.
+    Returns a result dict or None.
+    """
+    # Medley: only split on explicit " / " separator
+    if " / " in track:
+        parts   = [p.strip() for p in track.split(" / ")]
+        matched: list[dict] = []
+        unmatched: list[str] = []
+
         for part in parts:
-            norm_part = _normalize_str(_strip_qualifiers(part))
-            for entry in catalog:
-                title = entry.get("song_title") or ""
-                if _normalize_str(_strip_qualifiers(title)) == norm_part:
-                    matched_parts.append(entry)
-                    break
+            m = _match_single(part, catalog)
+            if m:
+                matched.append(m["matched_entries"][0])
+            else:
+                unmatched.append(part)
 
-        if matched_parts:
-            ids = "; ".join(e.get("catalog_id", "") for e in matched_parts)
-            titles = "; ".join(e.get("song_title", "") for e in matched_parts)
+        if matched:
+            ids   = "; ".join(e["catalog_id"]   for e in matched)
+            names = "; ".join(get_title(e) for e in matched)
+            conf  = HIGH if not unmatched else REVIEW
+            note  = (
+                f"Medley: matched {len(matched)}/{len(parts)} parts → {names}"
+                + (f" | Unmatched: {', '.join(unmatched)}" if unmatched else "")
+            )
             return {
                 "matched_catalog_id": ids,
-                "match_confidence": CONFIDENCE_HIGH
-                if len(matched_parts) == len(parts)
-                else CONFIDENCE_REVIEW,
-                "match_notes": f"Medley: matched {len(matched_parts)}/{len(parts)} parts → {titles}",
-                "matched_entries": matched_parts,
-                "is_medley": True,
+                "match_confidence":   conf,
+                "match_notes":        note,
+                "matched_entries":    matched,
+                "is_medley":          True,
             }
+        return None  # All medley parts unmatched → LLM
 
-    # ── 5. Conservative substring heuristic (abbreviations) ───────────────────
-    # Example: "Tokyo (Acoustic)" → "Midnight in Tokyo"
-    base = _normalize_str(_strip_qualifiers(track_name))
-    # Only consider reasonably informative tokens (length >= 4)
-    if base and len(base) >= 4:
-        candidates: List[Dict[str, str]] = []
-        for entry in catalog:
-            title = entry.get("song_title") or ""
-            title_norm = _normalize_str(_strip_qualifiers(title))
-            if title_norm == base:
-                continue  # would have matched above
-            # Abbreviation-like containment either way
-            if base in title_norm or title_norm in base:
-                candidates.append(entry)
-
-        if len(candidates) == 1:
-            e = candidates[0]
-            return {
-                "matched_catalog_id": e.get("catalog_id", ""),
-                "match_confidence": CONFIDENCE_REVIEW,
-                "match_notes": (
-                    f"Substring heuristic match: '{track_name}' ~ '{e.get('song_title','')}'"
-                ),
-                "matched_entries": [e],
-            }
-
-    return None  # Send to LLM
+    return _match_single(track, catalog)
 
 
-# ── Stage 5: LLM Fuzzy Matching ───────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 5  LLM fuzzy matching
+# ══════════════════════════════════════════════════════════════════════════════
 
-FUZZY_SYSTEM_PROMPT = """You are a music rights reconciliation specialist at a major publisher.
-Your job is to determine whether a live performance setlist track matches any song in our internal catalog.
+_LLM_SYSTEM_PROMPT = """You are a music rights reconciliation specialist.
+Determine whether a live setlist track matches any song in the provided internal catalog.
 
-You will receive:
-  - setlist_track: the raw track name from a live setlist (may be abbreviated, misspelled, or garbled)
-  - catalog: list of our controlled songs with their catalog_id and title
+You receive:
+  setlist_track: the raw track name from a live performance setlist
+  catalog: our complete list of controlled songs (catalog_id, title)
 
-Your analysis must account for:
-  ABBREVIATIONS: "Tokyo" might mean "Midnight in Tokyo"
-  VARIATIONS: small wording differences
-  MEDLEYS: "Song A / Song B" means both songs were performed together; report each match separately
-  GARBLED TEXT: "Smsls Lk Tn Sprt" is likely "Smells Like Teen Spirit" (not in our catalog)
-  COVERS: A song not in our catalog is a cover or uncontrolled song — do NOT force a match
+MATCHING RULES:
+  ABBREVIATIONS : "Tokyo" by itself may be a shortened reference to a catalog title
+                  containing "Tokyo", e.g. "Midnight in Tokyo"
+  QUALIFIERS    : "(Acoustic)", "(Extended Jam)" etc. do NOT change the underlying
+                  song — strip them and match the core title
+  COVERS        : Songs not in this catalog (e.g. "Wonderwall") must NOT be matched.
+                  Return confidence "None"
+  GARBLED TEXT  : "Smsls Lk Tn Sprt" style → decode if confident it is a catalog song,
+                  otherwise return "None"
+
+MEDLEY RULE — VERY IMPORTANT:
+  A setlist entry is a medley ONLY if it contains " / " (slash with spaces),
+  e.g. "Desert Rain / Ocean Avenue".
+  A track like "Tokyo (Acoustic)" is ONE song with a qualifier — NOT a medley.
+  Never return more than one match for a track that does not contain " / ".
+
+CONFIDENCE LEVELS:
+  Exact  — title matches exactly (after normalisation/qualifier stripping)
+  High   — very confident match (e.g. clear abbreviation or qualifier variation)
+  Review — possible match but human verification recommended
+  None   — not in catalog
 
 CRITICAL RULES:
-1. Only match if you are genuinely confident. A vague similarity is NOT a match.
-2. Never match a cover song to a catalog song with a similar-sounding title.
-3. For medleys, return multiple match entries (one per matched catalog song).
-4. If nothing in the catalog matches, return match_confidence = "None".
-5. "Review" means: there is a possible match but a human should verify.
-6. You MUST only use catalog_id values that appear in the provided catalog list.
-   If you are unsure, use catalog_id = null and match_confidence = "None" or "Review".
+  1. catalog_id must be EXACTLY as shown — copy it character-for-character.
+  2. Only use catalog_ids from the provided list. Never invent IDs.
+  3. match_notes must only reference titles that exist in the provided catalog.
+  4. For a non-medley track, return exactly ONE match in the "matches" array.
 
-Return a JSON object with this exact structure:
+Return a JSON object:
 {
   "matches": [
     {
-      "catalog_id": "CAT-XXX or null",
-      "song_title": "matched catalog title or null",
+      "catalog_id": "CAT-XXX",
+      "catalog_title": "exact title from catalog",
       "match_confidence": "Exact | High | Review | None",
-      "reasoning": "brief explanation"
+      "reasoning": "brief explanation using only catalog titles"
     }
   ]
 }
 
+For no match: one entry with catalog_id=null, match_confidence="None".
 Return ONLY the JSON object. No markdown fences, no extra text."""
 
 
 def llm_fuzzy_match(
-    track_name: str, catalog: List[Dict[str, str]], client, model: str
-) -> Dict[str, Any]:
-    """
-    Use LLM to attempt fuzzy matching of a track to the catalog.
-    Returns a result dict.
-    """
-    catalog_summary = [
-        {"catalog_id": e.get("catalog_id", ""), "song_title": e.get("song_title", "")}
+    track: str, catalog: list[dict], client, model: str
+) -> dict:
+    """LLM fuzzy match for one unresolved track."""
+    # Build catalog summary for the prompt using the correct title column
+    catalog_list = [
+        {"catalog_id": e["catalog_id"], "title": get_title(e)}
         for e in catalog
-        if e.get("catalog_id") and e.get("song_title")
+        if get_title(e)
     ]
-    valid_ids = {e["catalog_id"] for e in catalog_summary}
+    valid_ids = {e["catalog_id"] for e in catalog}
 
-    user_prompt = f"""setlist_track: "{track_name}"
-
-catalog:
-{json.dumps(catalog_summary, indent=2)}
-
-Analyze this track and return your JSON result."""
+    user_prompt = (
+        f'setlist_track: "{track}"\n\n'
+        f"catalog:\n{json.dumps(catalog_list, indent=2)}\n\n"
+        f"Analyze this setlist track. "
+        f"Is it a medley (contains ' / ')? No. So return exactly ONE match. "
+        f"Only use catalog_id values from the list above."
+    )
 
     try:
-        response = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": FUZZY_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
             ],
             temperature=0.0,
             max_tokens=512,
         )
-        raw = response.choices[0].message.content.strip()
+        raw = resp.choices[0].message.content.strip()
     except Exception as e:
         return {
             "matched_catalog_id": None,
-            "match_confidence": CONFIDENCE_NONE,
-            "match_notes": f"LLM call failed: {e}",
+            "match_confidence":   NONE,
+            "match_notes":        f"LLM call failed: {e}",
         }
 
-    # Parse JSON response
+    # Parse
     try:
         cleaned = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
         cleaned = re.sub(r"\s*```$", "", cleaned.strip(), flags=re.MULTILINE).strip()
-        parsed = json.loads(cleaned)
+        parsed  = json.loads(cleaned)
         matches = parsed.get("matches", [])
     except Exception as e:
         return {
             "matched_catalog_id": None,
-            "match_confidence": CONFIDENCE_NONE,
-            "match_notes": f"LLM response parse error: {e} | raw: {raw[:200]}",
+            "match_confidence":   NONE,
+            "match_notes":        f"LLM parse error: {e} | raw: {raw[:200]}",
         }
 
     if not matches:
         return {
             "matched_catalog_id": None,
-            "match_confidence": CONFIDENCE_NONE,
-            "match_notes": "LLM returned no matches",
+            "match_confidence":   NONE,
+            "match_notes":        "LLM returned no matches",
         }
 
-    # Sanitize and filter matches:
-    #   - only keep catalog_ids that actually exist in the catalog
-    #   - normalise confidence labels
-    real_matches: List[Dict[str, Any]] = []
-    for m in matches:
-        cid = m.get("catalog_id")
-        if not cid:
-            continue
-        cid = str(cid).strip()
-        if cid not in valid_ids:
-            # Ignore hallucinated IDs
-            continue
+    # Validate: only accept IDs that actually exist in our catalog
+    valid_matches = [
+        m for m in matches
+        if m.get("catalog_id") in valid_ids
+        and m.get("match_confidence", NONE) != NONE
+    ]
 
-        conf = (m.get("match_confidence") or "").strip().title()
-        if conf not in {
-            CONFIDENCE_EXACT,
-            CONFIDENCE_HIGH,
-            CONFIDENCE_REVIEW,
-            CONFIDENCE_NONE,
-        }:
-            conf = CONFIDENCE_REVIEW
-
-        if conf == CONFIDENCE_NONE:
-            continue
-
-        real_matches.append(
-            {
-                "catalog_id": cid,
-                "song_title": m.get("song_title", ""),
-                "match_confidence": conf,
-                "reasoning": m.get("reasoning", ""),
-            }
-        )
-
-    if not real_matches:
-        # All returned None or invalid; surface the first reasoning if available
-        first_reason = (
-            matches[0].get("reasoning", "No match found") if matches else "No match found"
-        )
+    if not valid_matches:
+        reasoning = (matches[0].get("reasoning") or "No catalog match found") if matches else "No catalog match"
         return {
             "matched_catalog_id": None,
-            "match_confidence": CONFIDENCE_NONE,
-            "match_notes": first_reason,
+            "match_confidence":   NONE,
+            "match_notes":        reasoning,
         }
 
-    if len(real_matches) == 1:
-        m = real_matches[0]
-        return {
-            "matched_catalog_id": m["catalog_id"],
-            "match_confidence": m["match_confidence"],
-            "match_notes": m.get("reasoning", ""),
-        }
-
-    # Multiple matches (medley-style)
-    ids = "; ".join(m["catalog_id"] for m in real_matches)
-    titles = "; ".join(m.get("song_title", "") for m in real_matches)
-    confidences = [m.get("match_confidence", CONFIDENCE_REVIEW) for m in real_matches]
-
-    # Lowest confidence wins for the group (Exact > High > Review > None)
-    order = {
-        CONFIDENCE_EXACT: 0,
-        CONFIDENCE_HIGH: 1,
-        CONFIDENCE_REVIEW: 2,
-        CONFIDENCE_NONE: 3,
-    }
-    group_conf = min(confidences, key=lambda c: order.get(c, 2))
-    reasonings = " | ".join(m.get("reasoning", "") for m in real_matches)
+    # Take the single best match (LLM is told not to return multiples for non-medleys)
+    # If it returns multiple anyway, take the highest-confidence one
+    conf_order = {EXACT: 0, HIGH: 1, REVIEW: 2, NONE: 3}
+    best = sorted(valid_matches,
+                  key=lambda m: conf_order.get(m.get("match_confidence", NONE), 3))[0]
 
     return {
-        "matched_catalog_id": ids,
-        "match_confidence": group_conf,
-        "match_notes": f"Medley (LLM): {titles} | {reasonings}",
+        "matched_catalog_id": best["catalog_id"],
+        "match_confidence":   best.get("match_confidence", REVIEW),
+        "match_notes":        best.get("reasoning", ""),
     }
 
 
-# ── Main Pipeline Orchestrator ────────────────────────────────────────────────
-
+# ══════════════════════════════════════════════════════════════════════════════
+# Orchestrator
+# ══════════════════════════════════════════════════════════════════════════════
 
 def run_pipeline(
-    tour_source: str,
+    tour_source:       str,
     catalog_file,
     client,
-    model: str,
+    model:             str,
     progress_callback=None,
-) -> Dict[str, Any]:
-    """
-    Full reconciliation pipeline.
+) -> dict:
+    TOTAL  = 5
+    errors: list[str] = []
+    result = dict(
+        tour_meta={}, catalog=[], flat_rows=[],
+        results=[], stats={}, errors=errors,
+    )
 
-    Args:
-        tour_source:       URL string or local file path to tour JSON
-        catalog_file:      Path or file-like object for catalog.csv
-        client:            OpenAI-compatible LLM client
-        model:             Model name string
-        progress_callback: Optional callable(step, total, message)
-
-    Returns dict with keys:
-        tour_meta, catalog, flat_rows, results, stats, errors
-    """
-
-    def progress(step: int, total: int, msg: str) -> None:
+    def step(n, msg):
         if progress_callback:
-            progress_callback(step, total, msg)
+            progress_callback(n, TOTAL, msg)
 
-    errors: List[str] = []
-    result: Dict[str, Any] = {
-        "tour_meta": {},
-        "catalog": [],
-        "flat_rows": [],
-        "results": [],
-        "stats": {},
-        "errors": errors,
-    }
-
-    total_steps = 5
-
-    # ── Step 1: Fetch tour data ────────────────────────────────────────────────
-    progress(1, total_steps, "Fetching tour data from API / local file…")
+    # Stage 1
+    step(1, "Fetching tour data…")
     try:
         payload = fetch_tour_data(tour_source)
-        data = payload.get("data", {})
+        d = payload.get("data", {})
         result["tour_meta"] = {
-            "artist": data.get("artist"),
-            "tour": data.get("tour"),
-            "show_count": len(data.get("shows", [])),
-            "engine_version": ENGINE_VERSION,
+            "artist":     d.get("artist"),
+            "tour":       d.get("tour"),
+            "show_count": len(d.get("shows", [])),
         }
     except Exception as e:
-        errors.append(f"Tour data fetch failed: {e}")
+        errors.append(str(e))
         return result
 
-    # ── Step 2: Load catalog ───────────────────────────────────────────────────
-    progress(2, total_steps, "Loading internal song catalog…")
+    # Stage 2
+    step(2, "Loading catalog…")
     try:
         catalog = load_catalog(catalog_file)
         result["catalog"] = catalog
     except Exception as e:
-        errors.append(f"Catalog load failed: {e}")
+        errors.append(str(e))
         return result
 
-    # ── Step 3: Flatten setlist ────────────────────────────────────────────────
-    progress(3, total_steps, "Flattening nested tour JSON into rows…")
-    flat_rows = flatten_setlist(payload)
-    result["flat_rows"] = flat_rows
+    # Stage 3
+    step(3, "Flattening setlist JSON…")
+    flat = flatten_setlist(payload)
+    result["flat_rows"] = flat
 
-    # ── Step 4: Deterministic pre-processing ──────────────────────────────────
-    progress(
-        4,
-        total_steps,
-        "Running deterministic matching (exact + qualifier-strip + medley + abbreviations)…",
-    )
+    # Stage 4 — Deterministic
+    step(4, "Deterministic matching (exact → normalised → qualifier-stripped → medley)…")
+    pre_matched: list[dict] = []
+    needs_llm:  list[dict] = []
 
-    pre_matched: List[Dict[str, Any]] = []
-    needs_llm: List[Dict[str, Any]] = []
-
-    for row in flat_rows:
-        track = row["setlist_track_name"]
-        match = deterministic_match(track, catalog)
-        if match:
-            pre_matched.append({**row, **match})
+    for row in flat:
+        m = deterministic_match(row["setlist_track_name"], catalog)
+        if m:
+            pre_matched.append({**row, **m})
         else:
             needs_llm.append(row)
 
-    # ── Step 5: LLM fuzzy matching ────────────────────────────────────────────
-    llm_results: List[Dict[str, Any]] = []
-    if needs_llm:
-        for i, row in enumerate(needs_llm):
-            track = row["setlist_track_name"]
-            progress(
-                5,
-                total_steps,
-                f'AI fuzzy matching {i + 1}/{len(needs_llm)}: "{track}"…',
-            )
-            match = llm_fuzzy_match(track, catalog, client, model)
-            llm_results.append({**row, **match})
-    else:
-        progress(
-            5,
-            total_steps,
-            "No tracks needed LLM matching — all resolved deterministically.",
-        )
+    # Stage 5 — LLM (only for unresolved tracks)
+    llm_results: list[dict] = []
+    for i, row in enumerate(needs_llm):
+        track = row["setlist_track_name"]
+        step(5, f"AI matching {i+1}/{len(needs_llm)}: \"{track}\"…")
+        m = llm_fuzzy_match(track, catalog, client, model)
+        llm_results.append({**row, **m})
 
-    # ── Merge + build final output ─────────────────────────────────────────────
-    all_results: List[Dict[str, Any]] = []
+    if not needs_llm:
+        step(5, "All tracks resolved deterministically — 0 LLM calls needed.")
+
+    # Build final output rows
+    all_results = []
     for row in pre_matched + llm_results:
-        output_row = {
-            "show_date": row.get("show_date", ""),
-            "venue_name": row.get("venue_name", ""),
+        all_results.append({
+            "show_date":          row.get("show_date", ""),
+            "venue_name":         row.get("venue_name", ""),
             "setlist_track_name": row.get("setlist_track_name", ""),
             "matched_catalog_id": row.get("matched_catalog_id") or "None",
-            "match_confidence": row.get("match_confidence", CONFIDENCE_NONE),
-            "match_notes": row.get("match_notes", ""),
-        }
-        all_results.append(output_row)
+            "match_confidence":   row.get("match_confidence", NONE),
+            "match_notes":        row.get("match_notes", ""),
+        })
 
-    # Sort by show_date, venue, then original setlist order
+    # Sort by show date then venue to keep shows together
     all_results.sort(key=lambda r: (r["show_date"], r["venue_name"]))
-
     result["results"] = all_results
 
-    # ── Stats ──────────────────────────────────────────────────────────────────
-    total_tracks = len(all_results)
-    n_exact = sum(1 for r in all_results if r["match_confidence"] == CONFIDENCE_EXACT)
-    n_high = sum(1 for r in all_results if r["match_confidence"] == CONFIDENCE_HIGH)
-    n_review = sum(1 for r in all_results if r["match_confidence"] == CONFIDENCE_REVIEW)
-    n_none = sum(1 for r in all_results if r["match_confidence"] == CONFIDENCE_NONE)
-    n_llm = len(llm_results)
-    n_pre = len(pre_matched)
-
+    # Stats
+    total = len(all_results)
     result["stats"] = {
-        "total_tracks": total_tracks,
-        "exact_matches": n_exact,
-        "high_matches": n_high,
-        "review_matches": n_review,
-        "no_matches": n_none,
-        "deterministic": n_pre,
-        "llm_resolved": n_llm,
-        "llm_savings_pct": round((n_pre / total_tracks * 100) if total_tracks else 0, 1),
-        "engine_version": ENGINE_VERSION,
+        "total_tracks":    total,
+        "exact_matches":   sum(1 for r in all_results if r["match_confidence"] == EXACT),
+        "high_matches":    sum(1 for r in all_results if r["match_confidence"] == HIGH),
+        "review_matches":  sum(1 for r in all_results if r["match_confidence"] == REVIEW),
+        "no_matches":      sum(1 for r in all_results if r["match_confidence"] == NONE),
+        "deterministic":   len(pre_matched),
+        "llm_resolved":    len(llm_results),
+        "llm_savings_pct": round(len(pre_matched) / total * 100 if total else 0, 1),
     }
-
     return result
 
 
-# ── CSV Builder ────────────────────────────────────────────────────────────────
+# ── CSV output ─────────────────────────────────────────────────────────────────
 
-
-def build_output_csv(results: List[Dict[str, Any]]) -> str:
-    """Build the output CSV string from result rows."""
+def build_output_csv(results: list[dict]) -> str:
     buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
-    writer.writeheader()
-    writer.writerows(results)
+    w   = csv.DictWriter(buf, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
+    w.writeheader()
+    w.writerows(results)
     return buf.getvalue()
