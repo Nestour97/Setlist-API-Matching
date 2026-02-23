@@ -16,6 +16,8 @@ import pandas as pd
 from pipeline import (
     run_pipeline,
     build_output_csv,
+    load_catalog,
+    get_title,
     EXACT   as CONFIDENCE_EXACT,
     HIGH    as CONFIDENCE_HIGH,
     REVIEW  as CONFIDENCE_REVIEW,
@@ -623,27 +625,30 @@ with col_src:
 with col_cat:
     st.markdown(f'<div class="wc-section">Internal Catalog</div>', unsafe_allow_html=True)
     if uploaded_catalog:
-        # Validate uploaded catalog immediately — show preview + warn on schema issues
+        # Validate uploaded catalog using the same load_catalog() the pipeline uses,
+        # so single-column "Warner-style" CSVs are parsed correctly.
         try:
-            import csv as _csv, io as _io
             uploaded_catalog.seek(0)
-            _rows = list(_csv.DictReader(_io.StringIO(
-                uploaded_catalog.read().decode("utf-8", errors="replace")
-            )))
+            _rows = load_catalog(uploaded_catalog)
             uploaded_catalog.seek(0)
-            _cols   = list(_rows[0].keys()) if _rows else []
-            _has_id = "catalog_id" in _cols
-            _title_col = next((c for c in ("title","song_title","name") if c in _cols), None)
+
+            _title_col = next(
+                (c for c in ("title", "song_title", "name", "track_title")
+                 if any(r.get(c, "").strip() for r in _rows)),
+                None,
+            )
+            _has_id = any(r.get("catalog_id", "").strip() for r in _rows)
 
             if not _has_id or not _title_col:
+                _sample_keys = list(_rows[0].keys()) if _rows else []
                 st.markdown(
                     f'<div class="error-box">⚠ Uploaded file is missing required columns.<br>'
-                    f'Found: {", ".join(_cols)}<br>'
+                    f'Found: {", ".join(_sample_keys)}<br>'
                     f'Need: <strong>catalog_id</strong> + <strong>title</strong> (or song_title).<br>'
                     f'<strong>Falling back to bundled catalog.csv</strong></div>',
                     unsafe_allow_html=True,
                 )
-                uploaded_catalog = None   # force fallback to bundled
+                uploaded_catalog = None
             else:
                 st.markdown(
                     f'<div class="success-box">✓ Uploaded: <strong>{uploaded_catalog.name}</strong> '
@@ -655,7 +660,7 @@ with col_cat:
                     f'<div style="font-family:DM Mono,monospace;font-size:10px;color:{GREY2};'
                     f'padding:2px 0;border-bottom:1px solid {BLACK3}">'
                     f'<span style="color:{GOLD};margin-right:12px">{r["catalog_id"]}</span>'
-                    f'{r.get(_title_col,"")}</div>'
+                    f'{r.get(_title_col, "")}</div>'
                     for r in _rows[:6]
                 )
                 if len(_rows) > 6:
