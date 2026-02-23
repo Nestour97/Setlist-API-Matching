@@ -578,7 +578,6 @@ with st.sidebar:
 st.markdown(f"""
 <div class="main-header">
   <div>
-    <div class="task-badge">Task 3</div>
     <div class="main-title">Setlist <span>Reconciliation</span></div>
   </div>
   <div class="main-sub">Fetch · Match · Flag · Deliver</div>
