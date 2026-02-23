@@ -514,11 +514,7 @@ with st.sidebar:
         ["OpenAI", "Groq", "Custom / Other"],
         index=1,
     )
-    api_key = st.text_input(
-        "API Key",
-        type="password",
-        value=os.environ.get("GROQ_API_KEY") or os.environ.get("OPENAI_API_KEY") or "",
-    )
+    api_key = os.environ.get("GROQ_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
     if provider == "OpenAI":
         model_default = "gpt-4o-mini"
     elif provider == "Groq":
@@ -649,48 +645,27 @@ with col_cat:
                 )
                 uploaded_catalog = None   # force fallback to bundled
             else:
-                _ids    = [r["catalog_id"]       for r in _rows]
-                _titles = [r.get(_title_col, "") for r in _rows]
-                # Check if this looks like the old wrong catalog (CAT-002=Tokyo Midnight etc)
-                _id_map = {r["catalog_id"]: r.get(_title_col,"") for r in _rows}
-                _wrong_hints = [
-                    k for k,v in _id_map.items()
-                    if (k=="CAT-002" and "Tokyo Midnight" in v)
-                    or (k=="CAT-003" and v in ("Desert Rain","Shatter","Shattered"))
-                    or (k=="CAT-013" and "Midnight" in v)
-                ]
-                if _wrong_hints:
-                    st.markdown(
-                        f'<div class="error-box">⚠ Uploaded catalog appears to have incorrect IDs '
-                        f'(e.g. {_id_map.get("CAT-002","?")} as CAT-002, '
-                        f'{_id_map.get("CAT-013","?")} as CAT-013).<br>'
-                        f'This is an old/wrong version of the catalog.<br>'
-                        f'<strong>Using bundled catalog.csv instead.</strong></div>',
-                        unsafe_allow_html=True,
-                    )
-                    uploaded_catalog = None   # force correct bundled catalog
-                else:
-                    st.markdown(
-                        f'<div class="success-box">✓ Uploaded: <strong>{uploaded_catalog.name}</strong> '
-                        f'· {len(_rows)} songs · column: <code>{_title_col}</code></div>',
-                        unsafe_allow_html=True,
-                    )
-                    # Show first few rows as preview
-                    preview_html = "".join(
-                        f'<div style="font-family:DM Mono,monospace;font-size:10px;color:{GREY2};'
-                        f'padding:2px 0;border-bottom:1px solid {BLACK3}">'
-                        f'<span style="color:{GOLD};margin-right:12px">{r["catalog_id"]}</span>'
-                        f'{r.get(_title_col,"")}</div>'
-                        for r in _rows[:6]
-                    )
-                    if len(_rows) > 6:
-                        preview_html += f'<div style="font-size:10px;color:{GREY3};margin-top:4px">…and {len(_rows)-6} more</div>'
-                    st.markdown(
-                        f'<div style="background:{BLACK2};border:1px solid {BLACK3};'
-                        f'border-left:3px solid {GOLD};padding:10px 14px;margin-top:6px">'
-                        f'{preview_html}</div>',
-                        unsafe_allow_html=True,
-                    )
+                st.markdown(
+                    f'<div class="success-box">✓ Uploaded: <strong>{uploaded_catalog.name}</strong> '
+                    f'· {len(_rows)} songs · column: <code>{_title_col}</code></div>',
+                    unsafe_allow_html=True,
+                )
+                # Show first few rows as preview
+                preview_html = "".join(
+                    f'<div style="font-family:DM Mono,monospace;font-size:10px;color:{GREY2};'
+                    f'padding:2px 0;border-bottom:1px solid {BLACK3}">'
+                    f'<span style="color:{GOLD};margin-right:12px">{r["catalog_id"]}</span>'
+                    f'{r.get(_title_col,"")}</div>'
+                    for r in _rows[:6]
+                )
+                if len(_rows) > 6:
+                    preview_html += f'<div style="font-size:10px;color:{GREY3};margin-top:4px">…and {len(_rows)-6} more</div>'
+                st.markdown(
+                    f'<div style="background:{BLACK2};border:1px solid {BLACK3};'
+                    f'border-left:3px solid {GOLD};padding:10px 14px;margin-top:6px">'
+                    f'{preview_html}</div>',
+                    unsafe_allow_html=True,
+                )
         except Exception as _e:
             st.markdown(
                 f'<div class="error-box">⚠ Could not read uploaded catalog: {_e}<br>'
@@ -738,16 +713,12 @@ col_run, col_warn = st.columns([1, 3])
 with col_run:
     run_clicked = st.button("▶  Run Reconciliation", use_container_width=True)
 with col_warn:
-    if not api_key:
-        st.markdown(
-            f'<div class="warn-box" style="margin:4px 0">Set your API key in the sidebar to run.</div>',
-            unsafe_allow_html=True,
-        )
+    pass
 
 # ── Pipeline execution ─────────────────────────────────────────────────────────
 if run_clicked:
     if not api_key:
-        st.error("Please enter an API key in the sidebar.")
+        st.error("No API key found. Please set GROQ_API_KEY or OPENAI_API_KEY environment variable.")
         st.stop()
     if not model:
         st.error("Please enter a model name in the sidebar.")
