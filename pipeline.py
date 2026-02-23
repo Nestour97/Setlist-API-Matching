@@ -1,21 +1,29 @@
 """
-pipeline.py  —  Setlist API Reconciliation Pipeline v3
+pipeline.py  —  Setlist API Reconciliation Pipeline v3.1
 Warner Chappell Music · Task 3
 
-Root-cause fixes in this version:
+Fixes in this version:
 
   FIX 1  Catalog column flexibility
          Real catalog uses 'title' not 'song_title', and 'controlled_percentage'
          not 'controlled'. A helper get_title() checks both column names so the
          pipeline works with any catalog CSV column naming convention.
 
-  FIX 2  Correct bundled catalog
+  FIX 2  Handles both "normal" CSV and the WCM assessment CSV
+         The original provided catalog has each entire row wrapped in quotes:
+           "catalog_id,title,writers,controlled_percentage"
+           "CAT-001,Neon Dreams,Alex Park,100"
+         To the Python csv module this looks like ONE big column, so there is no
+         'catalog_id' field and nothing ever matches.
+         load_catalog() now detects this pattern and reparses it correctly.
+
+  FIX 3  Correct bundled catalog
          catalog.csv now matches the real assessment file exactly:
            CAT-001=Neon Dreams, CAT-002=Midnight in Tokyo,
            CAT-003=Shattered Glass, CAT-004=Desert Rain, CAT-005=Ocean Avenue,
            CAT-006=Golden Gate, CAT-007=Velocity, CAT-013=The Glass House, etc.
 
-  FIX 3  Deterministic matching now works correctly
+  FIX 4  Deterministic matching now works correctly
          Because titles are read correctly, exact and normalised matching fire
          before any heuristics:
            "Shattered Glass"  → CAT-003 Exact  (no LLM)
@@ -24,13 +32,13 @@ Root-cause fixes in this version:
            "Desert Rain / Ocean Avenue" → CAT-004; CAT-005 High  (medley)
            "Velocity (Extended Jam)"    → CAT-007 High  (qualifier-stripped)
 
-  FIX 4  LLM prompt anti-medley guard
+  FIX 5  LLM prompt anti-medley guard
          The prompt now explicitly states: "Only treat a track as a medley if it
          contains ' / '. A qualifier like '(Acoustic)' or '(Extended)' does NOT
          make a medley — it is still one song."
          This prevents Tokyo (Acoustic) being returned as two matches.
 
-  FIX 5  LLM catalog grounding + post-validation
+  FIX 6  LLM catalog grounding + post-validation
          Every catalog_id the LLM returns is validated against the loaded catalog.
          Any ID not in the catalog is silently dropped, preventing hallucinated IDs.
 """
@@ -73,7 +81,7 @@ _QUALIFIER_PATTERNS = [
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Catalog helpers — flexible column detection
+# Catalog helpers — flexible column detection + WCM CSV repair
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_title(entry: dict) -> str:
@@ -86,6 +94,81 @@ def get_title(entry: dict) -> str:
         if v:
             return v
     return ""
+
+
+def _parse_warner_style_catalog(raw: str) -> list[dict]:
+    """
+    Handle the specific WCM assessment CSV format where each entire row is quoted:
+
+      "catalog_id,title,writers,controlled_percentage"
+      "CAT-001,Neon Dreams,Alex Park,100"
+      ...
+
+    To csv.DictReader this looks like a single column. Here we:
+
+      1. Strip BOM, normalise newlines
+      2. Split the single cell on commas to recover the real header
+      3. Split each data row on commas into fields
+    """
+    raw = raw.lstrip("\ufeff")
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+
+    reader = csv.reader(io.StringIO(raw))
+    rows = list(reader)
+    if not rows:
+        return []
+
+    # Header is a single cell like "catalog_id,title,writers,controlled_percentage"
+    header_cell = rows[0][0].strip().strip('"')
+    header = [h.strip() for h in header_cell.split(",")]
+
+    records: list[dict] = []
+    for r in rows[1:]:
+        if not r:
+            continue
+        cell = r[0].strip().strip('"')
+        if not cell:
+            continue
+        parts = [p.strip() for p in cell.split(",")]
+        # Pad if any trailing empty fields are missing
+        if len(parts) < len(header):
+            parts += [""] * (len(header) - len(parts))
+        records.append(dict(zip(header, parts[: len(header)])))
+    return records
+
+
+def load_catalog(catalog_file) -> list[dict]:
+    """
+    Load catalog CSV from path or file-like object.
+
+    Supports BOTH:
+      • normal CSV with proper columns
+      • the WCM "quoted whole row" CSV (original catalog.csv from the task)
+    """
+    try:
+        if hasattr(catalog_file, "read"):
+            content = catalog_file.read()
+            if isinstance(content, bytes):
+                content = content.decode("utf-8")
+        else:
+            with open(catalog_file, encoding="utf-8") as f:
+                content = f.read()
+    except Exception as e:
+        raise RuntimeError(f"Catalog load failed: {e}")
+
+    # Normalise BOM + newlines
+    text = content.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+
+    # Sniff the first row: if there is only ONE column but it contains commas,
+    # we are in the "warner-style" CSV case.
+    sample_reader = csv.reader(io.StringIO(text))
+    first_row = next(sample_reader, None)
+    if first_row is not None and len(first_row) == 1 and "," in first_row[0]:
+        rows = _parse_warner_style_catalog(text)
+    else:
+        rows = list(csv.DictReader(io.StringIO(text)))
+
+    return rows
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -128,31 +211,12 @@ def fetch_tour_data(source: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Stage 2  Catalog load
-# ══════════════════════════════════════════════════════════════════════════════
-
-def load_catalog(catalog_file) -> list[dict]:
-    """Load catalog CSV from path or file-like object."""
-    try:
-        if hasattr(catalog_file, "read"):
-            content = catalog_file.read()
-            if isinstance(content, bytes):
-                content = content.decode("utf-8")
-            catalog_file.seek(0)
-            return list(csv.DictReader(io.StringIO(content)))
-        with open(catalog_file, encoding="utf-8") as f:
-            return list(csv.DictReader(f))
-    except Exception as e:
-        raise RuntimeError(f"Catalog load failed: {e}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Stage 3  Flatten nested JSON
 # ══════════════════════════════════════════════════════════════════════════════
 
 def flatten_setlist(payload: dict) -> list[dict]:
     """Explode shows[].setlist[] into one dict per track, preserving order."""
-    rows = []
+    rows: list[dict] = []
     data = payload.get("data", {})
     for show in data.get("shows", []):
         for track in show.get("setlist", []):
@@ -171,8 +235,11 @@ def flatten_setlist(payload: dict) -> list[dict]:
 
 def _norm(s: str) -> str:
     """Lowercase, strip punctuation, collapse whitespace."""
-    return re.sub(r"\s+", " ",
-                  re.sub(r"[^\w\s]", "", s.lower())).strip()
+    return re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[^\w\s]", "", s.lower()),
+    ).strip()
 
 
 def _strip_qualifiers(s: str) -> str:
@@ -181,6 +248,15 @@ def _strip_qualifiers(s: str) -> str:
     for pat in _QUALIFIER_PATTERNS:
         result = re.sub(pat, "", result, flags=re.IGNORECASE)
     return re.sub(r"\s+", " ", result).strip()
+
+
+def _make_result(entry: dict, confidence: str, notes: str) -> dict:
+    return {
+        "matched_catalog_id": entry["catalog_id"],
+        "match_confidence":   confidence,
+        "match_notes":        notes,
+        "matched_entries":    [entry],
+    }
 
 
 def _match_single(track: str, catalog: list[dict]) -> Optional[dict]:
@@ -200,8 +276,8 @@ def _match_single(track: str, catalog: list[dict]) -> Optional[dict]:
     norm_stripped = _norm(stripped)
 
     for entry in catalog:
-        title     = get_title(entry)
-        norm_cat  = _norm(title)
+        title        = get_title(entry)
+        norm_cat     = _norm(title)
         stripped_cat = _norm(_strip_qualifiers(title))
 
         # 1. Exact
@@ -212,26 +288,17 @@ def _match_single(track: str, catalog: list[dict]) -> Optional[dict]:
         if norm_cat == norm_track and norm_track:
             return _make_result(
                 entry, EXACT,
-                f"Normalised exact match (case/punctuation difference)"
+                "Normalised exact match (case/punctuation difference)",
             )
 
         # 3. Qualifier-stripped normalised exact
         if stripped_cat == norm_stripped and norm_stripped:
             return _make_result(
                 entry, HIGH,
-                f"Qualifier-stripped match: '{track}' → '{title}'"
+                f"Qualifier-stripped match: '{track}' → '{title}'",
             )
 
     return None  # Nothing found deterministically → send to LLM
-
-
-def _make_result(entry: dict, confidence: str, notes: str) -> dict:
-    return {
-        "matched_catalog_id": entry["catalog_id"],
-        "match_confidence":   confidence,
-        "match_notes":        notes,
-        "matched_entries":    [entry],
-    }
 
 
 def deterministic_match(track: str, catalog: list[dict]) -> Optional[dict]:
@@ -241,9 +308,9 @@ def deterministic_match(track: str, catalog: list[dict]) -> Optional[dict]:
     """
     # Medley: only split on explicit " / " separator
     if " / " in track:
-        parts   = [p.strip() for p in track.split(" / ")]
-        matched: list[dict] = []
-        unmatched: list[str] = []
+        parts     = [p.strip() for p in track.split(" / ")]
+        matched   : list[dict] = []
+        unmatched : list[str]  = []
 
         for part in parts:
             m = _match_single(part, catalog)
@@ -253,7 +320,7 @@ def deterministic_match(track: str, catalog: list[dict]) -> Optional[dict]:
                 unmatched.append(part)
 
         if matched:
-            ids   = "; ".join(e["catalog_id"]   for e in matched)
+            ids   = "; ".join(e["catalog_id"] for e in matched)
             names = "; ".join(get_title(e) for e in matched)
             conf  = HIGH if not unmatched else REVIEW
             note  = (
@@ -326,7 +393,6 @@ Return a JSON object:
 For no match: one entry with catalog_id=null, match_confidence="None".
 Return ONLY the JSON object. No markdown fences, no extra text."""
 
-
 def llm_fuzzy_match(
     track: str, catalog: list[dict], client, model: str
 ) -> dict:
@@ -393,7 +459,9 @@ def llm_fuzzy_match(
     ]
 
     if not valid_matches:
-        reasoning = (matches[0].get("reasoning") or "No catalog match found") if matches else "No catalog match"
+        reasoning = (
+            matches[0].get("reasoning") or "No catalog match found"
+        ) if matches else "No catalog match"
         return {
             "matched_catalog_id": None,
             "match_confidence":   NONE,
@@ -401,10 +469,11 @@ def llm_fuzzy_match(
         }
 
     # Take the single best match (LLM is told not to return multiples for non-medleys)
-    # If it returns multiple anyway, take the highest-confidence one
     conf_order = {EXACT: 0, HIGH: 1, REVIEW: 2, NONE: 3}
-    best = sorted(valid_matches,
-                  key=lambda m: conf_order.get(m.get("match_confidence", NONE), 3))[0]
+    best = sorted(
+        valid_matches,
+        key=lambda m: conf_order.get(m.get("match_confidence", NONE), 3),
+    )[0]
 
     return {
         "matched_catalog_id": best["catalog_id"],
@@ -466,7 +535,7 @@ def run_pipeline(
     # Stage 4 — Deterministic
     step(4, "Deterministic matching (exact → normalised → qualifier-stripped → medley)…")
     pre_matched: list[dict] = []
-    needs_llm:  list[dict] = []
+    needs_llm:   list[dict] = []
 
     for row in flat:
         m = deterministic_match(row["setlist_track_name"], catalog)
@@ -487,7 +556,7 @@ def run_pipeline(
         step(5, "All tracks resolved deterministically — 0 LLM calls needed.")
 
     # Build final output rows
-    all_results = []
+    all_results: list[dict] = []
     for row in pre_matched + llm_results:
         all_results.append({
             "show_date":          row.get("show_date", ""),
