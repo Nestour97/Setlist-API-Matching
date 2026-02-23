@@ -16,7 +16,10 @@ import pandas as pd
 from pipeline import (
     run_pipeline,
     build_output_csv,
-    CONFIDENCE_EXACT, CONFIDENCE_HIGH, CONFIDENCE_REVIEW, CONFIDENCE_NONE,
+    EXACT   as CONFIDENCE_EXACT,
+    HIGH    as CONFIDENCE_HIGH,
+    REVIEW  as CONFIDENCE_REVIEW,
+    NONE    as CONFIDENCE_NONE,
 )
 
 # ── Page Config ────────────────────────────────────────────────────────────────
